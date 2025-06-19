@@ -1,11 +1,11 @@
-name: CI/CD Deploy via Bastion Jump SSH
+name: CI/CD Deploy via Bastion Jump Host
 
 on:
   push:
     branches: [main]
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
     environment: lens
 
@@ -35,25 +35,25 @@ jobs:
       run: |
         docker push ${{ secrets.ECR_REPO }}:latest
 
-    - name: SSH into Bastion and Deploy on Backend EC2
+    - name: Deploy to Private EC2 via Bastion
       uses: appleboy/ssh-action@v1.0.0
       with:
         host: ${{ secrets.EC2_BASTION }}
         username: ${{ secrets.EC2_USER }}
         key: ${{ secrets.EC2_SSH_KEY }}
         script: |
-          echo "SSHing from Bastion to Backend EC2..."
+          echo "Connecting to backend EC2 via lens.pem from Bastion..."
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/lens.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_BACKEND }} << 'INNER_SSH'
-            echo "Login to ECR from private EC2..."
+            echo "Logging into ECR from backend EC2..."
             docker login -u AWS -p $(aws ecr get-login-password --region ${{ secrets.AWS_REGION }}) ${{ secrets.ECR_REPO }}
 
-            echo "Pull latest Docker image..."
+            echo "Pulling latest image..."
             docker pull ${{ secrets.ECR_REPO }}:latest
 
-            echo "Stop existing container..."
+            echo "Stopping existing container if exists..."
             docker stop app || true
             docker rm app || true
 
-            echo "Run container on port 5000..."
+            echo "Running container on port 5000..."
             docker run -d --name app -p 5000:5000 ${{ secrets.ECR_REPO }}:latest
           INNER_SSH
