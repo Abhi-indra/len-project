@@ -10,6 +10,7 @@ jobs:
     environment: lens
 
     steps:
+    # ──────────────────────────── BUILD ────────────────────────────
     - name: Checkout code
       uses: actions/checkout@v3
 
@@ -19,52 +20,73 @@ jobs:
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-access-key-id:      ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key:  ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region:             ${{ secrets.AWS_REGION }}
 
     - name: Login to Amazon ECR
-      id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
-    - name: Build Docker image
+    - name: Build & tag Docker image
       run: |
-        docker build -t ${{ secrets.ECR_REPO }}:latest -f application/Dockerfile application
+        TAG=$(git rev-parse --short=8 HEAD)
+        docker build \
+          -t ${{ secrets.ECR_REPO }}:$TAG \
+          -t ${{ secrets.ECR_REPO }}:latest \
+          -f application/Dockerfile application
 
     - name: Push Docker image to ECR
       run: |
+        TAG=$(git rev-parse --short=8 HEAD)
+        docker push ${{ secrets.ECR_REPO }}:$TAG
         docker push ${{ secrets.ECR_REPO }}:latest
 
-    - name: Deploy to Private EC2 via Bastion (Raw SSH + Debug)
+    # ──────────────────────────── DEPLOY ────────────────────────────
+    - name: Deploy to Private EC2 via Bastion
       uses: appleboy/ssh-action@v1.0.0
+      env:
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        ECR_REPO:  ${{ secrets.ECR_REPO }}
+        BACKEND:   ${{ secrets.EC2_BACKEND }}
+        USER:      ${{ secrets.EC2_USER }}
       with:
-        host: ${{ secrets.EC2_BASTION }}
+        host:     ${{ secrets.EC2_BASTION }}
         username: ${{ secrets.EC2_USER }}
-        key: ${{ secrets.EC2_SSH_KEY }}
+        key:      ${{ secrets.EC2_SSH_KEY }}
         script: |
-          echo "🟡 Creating SSH key file on Bastion..."
-          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/lens.pem
-          chmod 400 ~/.ssh/lens.pem
+          set -euo pipefail
+          KEY=~/.ssh/lens.pem
 
-          echo "🟡 Checking network from Bastion to Backend..."
+          # ── 1. Ensure key exists once ─────────────────────────────
+          if [ ! -s "$KEY" ]; then
+            echo "🟡 First run: writing $KEY"
+            printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > "$KEY"
+            chmod 400 "$KEY"
+          else
+            echo "🟡 $KEY already exists – skipping"
+          fi
+
+          # ── 2. Quick network sanity check ────────────────────────
           ip route
-          ping -c 3 ${{ secrets.EC2_BACKEND }}
+          ping -c3 "$BACKEND" || true
 
-          echo "🟡 Trying raw SSH to Backend with -vvv debug logs..."
-          ssh -vvv -o StrictHostKeyChecking=no -i ~/.ssh/lens.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_BACKEND }} << 'INNER_SSH'
-            echo "🟢 Connected to Backend EC2"
-            hostname
-            whoami
-            echo "💻 Logging in to ECR..."
-            docker login -u AWS -p $(aws ecr get-login-password --region ${{ secrets.AWS_REGION }}) ${{ secrets.ECR_REPO }}
+          # ── 3. Hop to backend host and deploy ────────────────────
+          ssh -o StrictHostKeyChecking=no -i "$KEY" "$USER@$BACKEND" bash -s -- <<'EOF'
+            set -euo pipefail
+            echo "🟢 On $(hostname) as $(whoami)"
 
-            echo "📦 Pulling Docker image..."
-            docker pull ${{ secrets.ECR_REPO }}:latest
+            # Login to ECR
+            aws ecr get-login-password --region "$AWS_REGION" \
+              | docker login --username AWS --password-stdin "$ECR_REPO"
 
-            echo "🛑 Stopping old container (if any)..."
-            docker stop app || true
-            docker rm app || true
+            # Pull image tagged with current commit, fallback to latest
+            TAG=$(git rev-parse --short=8 HEAD || echo latest)
+            docker pull "$ECR_REPO:$TAG" || docker pull "$ECR_REPO:latest"
 
-            echo "🚀 Running new container on port 5000..."
-            docker run -d --name app -p 5000:5000 ${{ secrets.ECR_REPO }}:latest
-          INNER_SSH
+            # Stop & remove any existing container
+            docker stop app 2>/dev/null || true
+            docker rm   app 2>/dev/null || true
+
+            # Run the new container
+            docker run -d --restart=always --name app -p 5000:5000 "$ECR_REPO:$TAG"
+          EOF
