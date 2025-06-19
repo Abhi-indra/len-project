@@ -10,86 +10,77 @@ jobs:
     environment: lens
 
     steps:
-    # ────────────── BUILD & PUSH ──────────────
-    - name: Checkout code
-      uses: actions/checkout@v3
+    # ── BUILD & PUSH ───────────────────────────────────────────────
+    - uses: actions/checkout@v3
 
-    - name: Export short SHA
-      id: vars
-      run: echo "tag=${GITHUB_SHA::8}" >>"$GITHUB_OUTPUT"
+    - id: vars
+      run: echo "TAG=${GITHUB_SHA::8}" >>"$GITHUB_OUTPUT"
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+    - uses: docker/setup-buildx-action@v3
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
+    - uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id:      ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key:  ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region:             ${{ secrets.AWS_REGION }}
 
-    - name: Login to Amazon ECR
-      uses: aws-actions/amazon-ecr-login@v1
+    - uses: aws-actions/amazon-ecr-login@v1
 
-    - name: Build Docker image
+    - name: Build & push image
       run: |
-        docker build \
-          -t ${{ secrets.ECR_REPO }}:${{ steps.vars.outputs.tag }} \
-          -t ${{ secrets.ECR_REPO }}:latest \
-          -f application/Dockerfile application
+        REPO=${{ secrets.ECR_REPO }}
+        TAG=${{ steps.vars.outputs.TAG }}
+        docker build -t "$REPO:$TAG" -t "$REPO:latest" -f application/Dockerfile application
+        docker push "$REPO:$TAG"
+        docker push "$REPO:latest"
 
-    - name: Push Docker image
-      run: |
-        docker push ${{ secrets.ECR_REPO }}:${{ steps.vars.outputs.tag }}
-        docker push ${{ secrets.ECR_REPO }}:latest
-
-    # ─────────────── DEPLOY ───────────────
-    - name: Deploy to Private EC2 via Bastion
+    # ── DEPLOY ─────────────────────────────────────────────────────
+    - name: Deploy via bastion
       uses: appleboy/ssh-action@v1.0.0
-      env:                       # exported for the bash script
+      env:       # export for the *first* (bastion) shell
         AWS_REGION: ${{ secrets.AWS_REGION }}
         ECR_REPO:   ${{ secrets.ECR_REPO }}
         BACKEND_IP: ${{ secrets.EC2_BACKEND }}
-        USERNAME:   ${{ secrets.EC2_USER }}
-        TAG:        ${{ steps.vars.outputs.tag }}
+        TAG:        ${{ steps.vars.outputs.TAG }}
       with:
-        host:     ${{ secrets.EC2_BASTION }}   # Bastion public IP or DNS
+        host:     ${{ secrets.EC2_BASTION }}
         username: ${{ secrets.EC2_USER }}
         key:      ${{ secrets.EC2_SSH_KEY }}
-        timeout:  "120s"            # <-- moved here (valid input)
-        command_timeout: "1800s"    # optional; 30-min max runtime
+        timeout:  "120s"
         script: |
           set -euo pipefail
+
+          # ── 0) Guard clauses ────────────────────────────────────
+          for v in AWS_REGION ECR_REPO BACKEND_IP TAG; do
+            printf '%s=%s***\n' "$v" "${!v:0:4}"
+            if [[ -z "${!v:-}" ]]; then
+              echo "::error::$v is empty – check your secrets."
+              exit 1
+            fi
+          done
+
           KEY=~/.ssh/lens.pem
+          [[ -s $KEY ]] || { printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" >"$KEY" && chmod 400 "$KEY"; }
 
-          # 1) Ensure the key exists once
-          if [ ! -s "$KEY" ]; then
-            echo "🟡 First run: writing $KEY"
-            printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" >"$KEY"
-            chmod 400 "$KEY"
-          else
-            echo "🟡 $KEY already exists – skipping"
-          fi
+          # ── 1) Network check ───────────────────────────────────
+          ping -c3 "$BACKEND_IP" || { echo "::warning::ping failed, continuing"; }
 
-          # 2) Sanity check connectivity
-          ip route
-          ping -c3 "$BACKEND_IP" || true
-
-          # 3) Hop to backend and deploy
-          ssh -o StrictHostKeyChecking=no -i "$KEY" "$USERNAME@$BACKEND_IP" bash -s -- <<EOF
+          # ── 2) Hop to backend host ─────────────────────────────
+          ssh -o StrictHostKeyChecking=no -i "$KEY" ${{ secrets.EC2_USER }}@"$BACKEND_IP" bash -s -- \
+            "$AWS_REGION" "$ECR_REPO" "$TAG" <<'INNER'
             set -euo pipefail
-            echo "🟢 On \$(hostname) as \$(whoami)"
+            AWS_REGION=$1
+            ECR_REPO=$2
+            TAG=$3
 
-            # Login to ECR
-            aws ecr get-login-password --region "${AWS_REGION}" \
-              | docker login --username AWS --password-stdin "${ECR_REPO}"
+            echo "🟢 On $(hostname) – deploying $ECR_REPO:$TAG"
 
-            # Pull image (exact tag -> fallback :latest)
-            docker pull "${ECR_REPO}:${TAG}" || docker pull "${ECR_REPO}:latest"
+            aws ecr get-login-password --region "$AWS_REGION" \
+              | docker login --username AWS --password-stdin "$ECR_REPO"
 
-            # Replace container
+            docker pull "$ECR_REPO:$TAG" || docker pull "$ECR_REPO:latest"
+
             docker stop app 2>/dev/null || true
             docker rm   app 2>/dev/null || true
-            docker run -d --restart=always \
-              --name app -p 5000:5000 "${ECR_REPO}:${TAG}"
-          EOF
+            docker run -d --restart=always --name app -p 5000:5000 "$ECR_REPO:$TAG"
+INNER
