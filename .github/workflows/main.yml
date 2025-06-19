@@ -14,30 +14,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout source code
+    - name: ✅ Checkout source code
       uses: actions/checkout@v3
 
-    - name: Configure AWS credentials
+    - name: ✅ Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+        aws-region: ${{ secrets.AWS_REGION }}   # ✅ use secrets directly
 
-    - name: Login to Amazon ECR
+    - name: ✅ Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Build Docker image
+    - name: ✅ Build Docker image
       run: |
         docker build -t lens .
         docker tag lens:latest $ECR_REPO:latest
 
-    - name: Push image to ECR
+    - name: ✅ Push Docker image to ECR
       run: |
         docker push $ECR_REPO:latest
 
-    - name: SSH & Deploy to Backend EC2 via Bastion
+    - name: ✅ SSH & Deploy to Backend EC2 via Bastion
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.EC2_BACKEND }}
@@ -47,7 +47,14 @@ jobs:
         proxy_username: ${{ secrets.EC2_USER }}
         proxy_key: ${{ secrets.EC2_SSH_KEY }}
         script: |
-          sudo aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin $ECR_REPO
+          echo "🔑 Logging into ECR from EC2..."
+          sudo aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin $ECR_REPO
+          
+          echo "📂 Navigating to application directory..."
           cd /home/ubuntu/application
+          
+          echo "⬇️ Pulling latest image..."
           sudo docker-compose pull
+          
+          echo "♻️ Restarting services..."
           sudo docker-compose up -d
