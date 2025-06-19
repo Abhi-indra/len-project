@@ -204,7 +204,6 @@ jobs:
 | **Load Balancer**  | ![ALB](./screenshots/alb.png)                   |
 | **Final Output**   | ![Output](./screenshots/output.png)             |
 
-(*Make sure to place the actual images in a `screenshots/` folder!*)
 
 ---
 
