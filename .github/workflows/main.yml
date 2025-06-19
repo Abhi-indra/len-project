@@ -1,9 +1,8 @@
-name: CI/CD with Bastion and ECR
+name: CI/CD Deploy via Bastion
 
 on:
   push:
     branches: [main]
-
 
 jobs:
   build-and-deploy:
@@ -36,7 +35,7 @@ jobs:
       run: |
         docker push ${{ secrets.ECR_REPO }}:latest
 
-    - name: Deploy via Bastion Host
+    - name: Deploy to EC2 via Bastion
       uses: appleboy/ssh-action@v1.0.0
       with:
         host: ${{ secrets.EC2_BACKEND }}
@@ -45,11 +44,13 @@ jobs:
         proxy_host: ${{ secrets.EC2_BASTION }}
         proxy_username: ${{ secrets.EC2_USER }}
         proxy_key: ${{ secrets.EC2_SSH_KEY }}
+        port: 22
+        proxy_port: 22
         script: |
-          echo "Logging into ECR from EC2..."
+          echo "Login to ECR..."
           docker login -u AWS -p $(aws ecr get-login-password --region ${{ secrets.AWS_REGION }}) ${{ secrets.ECR_REPO }}
 
-          echo "Pulling latest image..."
+          echo "Pulling latest Docker image..."
           docker pull ${{ secrets.ECR_REPO }}:latest
 
           echo "Stopping existing container..."
