@@ -10,14 +10,13 @@ jobs:
     environment: lens
 
     steps:
-    # ───────────────────────── BUILD & PUSH ─────────────────────────
+    # ────────────── BUILD & PUSH ──────────────
     - name: Checkout code
       uses: actions/checkout@v3
 
-    # Short, reproducible image tag = first 8 chars of commit SHA
     - name: Export short SHA
       id: vars
-      run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+      run: echo "tag=${GITHUB_SHA::8}" >>"$GITHUB_OUTPUT"
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -39,43 +38,44 @@ jobs:
           -t ${{ secrets.ECR_REPO }}:latest \
           -f application/Dockerfile application
 
-    - name: Push Docker image to ECR
+    - name: Push Docker image
       run: |
         docker push ${{ secrets.ECR_REPO }}:${{ steps.vars.outputs.tag }}
         docker push ${{ secrets.ECR_REPO }}:latest
 
-    # ───────────────────────────── DEPLOY ────────────────────────────
+    # ─────────────── DEPLOY ───────────────
     - name: Deploy to Private EC2 via Bastion
       uses: appleboy/ssh-action@v1.0.0
-      timeout: "120s"            # give the TCP handshake more time
-      env:                       # all values needed INSIDE the script
+      env:                       # exported for the bash script
         AWS_REGION: ${{ secrets.AWS_REGION }}
         ECR_REPO:   ${{ secrets.ECR_REPO }}
         BACKEND_IP: ${{ secrets.EC2_BACKEND }}
         USERNAME:   ${{ secrets.EC2_USER }}
         TAG:        ${{ steps.vars.outputs.tag }}
       with:
-        host:     ${{ secrets.EC2_BASTION }}   # bastion public IP/DNS
+        host:     ${{ secrets.EC2_BASTION }}   # Bastion public IP or DNS
         username: ${{ secrets.EC2_USER }}
         key:      ${{ secrets.EC2_SSH_KEY }}
+        timeout:  "120s"            # <-- moved here (valid input)
+        command_timeout: "1800s"    # optional; 30-min max runtime
         script: |
           set -euo pipefail
           KEY=~/.ssh/lens.pem
 
-          # 1) Ensure the key exists only once
+          # 1) Ensure the key exists once
           if [ ! -s "$KEY" ]; then
             echo "🟡 First run: writing $KEY"
-            printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > "$KEY"
+            printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" >"$KEY"
             chmod 400 "$KEY"
           else
             echo "🟡 $KEY already exists – skipping"
           fi
 
-          # 2) Quick network sanity check
+          # 2) Sanity check connectivity
           ip route
           ping -c3 "$BACKEND_IP" || true
 
-          # 3) Hop from bastion → backend and deploy
+          # 3) Hop to backend and deploy
           ssh -o StrictHostKeyChecking=no -i "$KEY" "$USERNAME@$BACKEND_IP" bash -s -- <<EOF
             set -euo pipefail
             echo "🟢 On \$(hostname) as \$(whoami)"
@@ -84,14 +84,12 @@ jobs:
             aws ecr get-login-password --region "${AWS_REGION}" \
               | docker login --username AWS --password-stdin "${ECR_REPO}"
 
-            # Pull the exact image; fall back to :latest if needed
+            # Pull image (exact tag -> fallback :latest)
             docker pull "${ECR_REPO}:${TAG}" || docker pull "${ECR_REPO}:latest"
 
-            # Stop & remove any existing container
+            # Replace container
             docker stop app 2>/dev/null || true
             docker rm   app 2>/dev/null || true
-
-            # Run the new container
             docker run -d --restart=always \
               --name app -p 5000:5000 "${ECR_REPO}:${TAG}"
           EOF
