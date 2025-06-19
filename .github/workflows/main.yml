@@ -29,11 +29,15 @@ jobs:
 
     - name: Build Docker image
       run: |
-        docker build -t ${{ secrets.ECR_REPO }}:latest .
+        docker build -t ${{ secrets.ECR_REPO }}:latest -f application/Dockerfile application
 
     - name: Push Docker image to ECR
       run: |
         docker push ${{ secrets.ECR_REPO }}:latest
+
+    - name: [Optional] Run Tests
+      run: |
+        echo "Insert test logic here if needed"
 
     - name: Deploy via Bastion Host
       uses: appleboy/ssh-action@v1.0.0
