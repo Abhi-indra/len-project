@@ -10,9 +10,14 @@ jobs:
     environment: lens
 
     steps:
-    # ──────────────────────────── BUILD ────────────────────────────
+    # ───────────────────────── BUILD & PUSH ─────────────────────────
     - name: Checkout code
       uses: actions/checkout@v3
+
+    # Short, reproducible image tag = first 8 chars of commit SHA
+    - name: Export short SHA
+      id: vars
+      run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -27,37 +32,37 @@ jobs:
     - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
 
-    - name: Build & tag Docker image
+    - name: Build Docker image
       run: |
-        TAG=$(git rev-parse --short=8 HEAD)
         docker build \
-          -t ${{ secrets.ECR_REPO }}:$TAG \
+          -t ${{ secrets.ECR_REPO }}:${{ steps.vars.outputs.tag }} \
           -t ${{ secrets.ECR_REPO }}:latest \
           -f application/Dockerfile application
 
     - name: Push Docker image to ECR
       run: |
-        TAG=$(git rev-parse --short=8 HEAD)
-        docker push ${{ secrets.ECR_REPO }}:$TAG
+        docker push ${{ secrets.ECR_REPO }}:${{ steps.vars.outputs.tag }}
         docker push ${{ secrets.ECR_REPO }}:latest
 
-    # ──────────────────────────── DEPLOY ────────────────────────────
+    # ───────────────────────────── DEPLOY ────────────────────────────
     - name: Deploy to Private EC2 via Bastion
       uses: appleboy/ssh-action@v1.0.0
-      env:
+      timeout: "120s"            # give the TCP handshake more time
+      env:                       # all values needed INSIDE the script
         AWS_REGION: ${{ secrets.AWS_REGION }}
-        ECR_REPO:  ${{ secrets.ECR_REPO }}
-        BACKEND:   ${{ secrets.EC2_BACKEND }}
-        USER:      ${{ secrets.EC2_USER }}
+        ECR_REPO:   ${{ secrets.ECR_REPO }}
+        BACKEND_IP: ${{ secrets.EC2_BACKEND }}
+        USERNAME:   ${{ secrets.EC2_USER }}
+        TAG:        ${{ steps.vars.outputs.tag }}
       with:
-        host:     ${{ secrets.EC2_BASTION }}
+        host:     ${{ secrets.EC2_BASTION }}   # bastion public IP/DNS
         username: ${{ secrets.EC2_USER }}
         key:      ${{ secrets.EC2_SSH_KEY }}
         script: |
           set -euo pipefail
           KEY=~/.ssh/lens.pem
 
-          # ── 1. Ensure key exists once ─────────────────────────────
+          # 1) Ensure the key exists only once
           if [ ! -s "$KEY" ]; then
             echo "🟡 First run: writing $KEY"
             printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > "$KEY"
@@ -66,27 +71,27 @@ jobs:
             echo "🟡 $KEY already exists – skipping"
           fi
 
-          # ── 2. Quick network sanity check ────────────────────────
+          # 2) Quick network sanity check
           ip route
-          ping -c3 "$BACKEND" || true
+          ping -c3 "$BACKEND_IP" || true
 
-          # ── 3. Hop to backend host and deploy ────────────────────
-          ssh -o StrictHostKeyChecking=no -i "$KEY" "$USER@$BACKEND" bash -s -- <<'EOF'
+          # 3) Hop from bastion → backend and deploy
+          ssh -o StrictHostKeyChecking=no -i "$KEY" "$USERNAME@$BACKEND_IP" bash -s -- <<EOF
             set -euo pipefail
-            echo "🟢 On $(hostname) as $(whoami)"
+            echo "🟢 On \$(hostname) as \$(whoami)"
 
             # Login to ECR
-            aws ecr get-login-password --region "$AWS_REGION" \
-              | docker login --username AWS --password-stdin "$ECR_REPO"
+            aws ecr get-login-password --region "${AWS_REGION}" \
+              | docker login --username AWS --password-stdin "${ECR_REPO}"
 
-            # Pull image tagged with current commit, fallback to latest
-            TAG=$(git rev-parse --short=8 HEAD || echo latest)
-            docker pull "$ECR_REPO:$TAG" || docker pull "$ECR_REPO:latest"
+            # Pull the exact image; fall back to :latest if needed
+            docker pull "${ECR_REPO}:${TAG}" || docker pull "${ECR_REPO}:latest"
 
             # Stop & remove any existing container
             docker stop app 2>/dev/null || true
             docker rm   app 2>/dev/null || true
 
             # Run the new container
-            docker run -d --restart=always --name app -p 5000:5000 "$ECR_REPO:$TAG"
+            docker run -d --restart=always \
+              --name app -p 5000:5000 "${ECR_REPO}:${TAG}"
           EOF
