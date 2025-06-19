@@ -1,11 +1,11 @@
-name: CI/CD Deploy via Bastion
+name: CI/CD Deploy via Bastion Jump SSH
 
 on:
   push:
     branches: [main]
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     environment: lens
 
@@ -35,27 +35,25 @@ jobs:
       run: |
         docker push ${{ secrets.ECR_REPO }}:latest
 
-    - name: Deploy to EC2 via Bastion
+    - name: SSH into Bastion and Deploy on Backend EC2
       uses: appleboy/ssh-action@v1.0.0
       with:
-        host: ${{ secrets.EC2_BACKEND }}
+        host: ${{ secrets.EC2_BASTION }}
         username: ${{ secrets.EC2_USER }}
         key: ${{ secrets.EC2_SSH_KEY }}
-        proxy_host: ${{ secrets.EC2_BASTION }}
-        proxy_username: ${{ secrets.EC2_USER }}
-        proxy_key: ${{ secrets.EC2_SSH_KEY }}
-        port: 22
-        proxy_port: 22
         script: |
-          echo "Login to ECR..."
-          docker login -u AWS -p $(aws ecr get-login-password --region ${{ secrets.AWS_REGION }}) ${{ secrets.ECR_REPO }}
+          echo "SSHing from Bastion to Backend EC2..."
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/lens.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_BACKEND }} << 'INNER_SSH'
+            echo "Login to ECR from private EC2..."
+            docker login -u AWS -p $(aws ecr get-login-password --region ${{ secrets.AWS_REGION }}) ${{ secrets.ECR_REPO }}
 
-          echo "Pulling latest Docker image..."
-          docker pull ${{ secrets.ECR_REPO }}:latest
+            echo "Pull latest Docker image..."
+            docker pull ${{ secrets.ECR_REPO }}:latest
 
-          echo "Stopping existing container..."
-          docker stop app || true
-          docker rm app || true
+            echo "Stop existing container..."
+            docker stop app || true
+            docker rm app || true
 
-          echo "Running container on port 5000..."
-          docker run -d --name app -p 5000:5000 ${{ secrets.ECR_REPO }}:latest
+            echo "Run container on port 5000..."
+            docker run -d --name app -p 5000:5000 ${{ secrets.ECR_REPO }}:latest
+          INNER_SSH
